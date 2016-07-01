@@ -67,12 +67,14 @@ struct rule_t {
 struct rule_t *rules = NULL;
 int verbose = 0;
 int queue_num = 0;
+int encoded = 0;
 
 void usage()
 {
     fprintf(stderr, "Usage: nfqsed -s /val1/val2 [-s /val1/val2] [-f file] [-v] [-q num]\n"
             "  -s val1/val2     - replaces occurences of val1 with val2 in the packet payload\n"
             "  -f file          - read replacement rules from the specified file\n"
+            "  -e               - search/replace strings are hex encoded\n"
             "  -q num           - bind to queue with number 'num' (default 0)\n"
             "  -v               - be verbose\n");
     exit(1);
@@ -82,11 +84,11 @@ void print_rule(const struct rule_t *rule)
 {
     int i = 0;
     for (i = 0 ; i < rule->length ; i++) {
-        printf("%x", rule->val1[i]);
+        printf("%02x", rule->val1[i]);
     }
     printf(" -> ");
     for (i = 0 ; i < rule->length ; i++) {
-        printf("%x", rule->val2[i]);
+        printf("%02x", rule->val2[i]);
     }
     printf("\n");
 }
@@ -97,6 +99,10 @@ void add_rule(const char *rule_str)
     char *pos = NULL;
     int length = 0;
     struct rule_t *rule;
+
+    unsigned char decoded[1024];
+    int i = 0;
+
     if (strlen(rule_str) < 4) {
         fprintf(stderr, "rule too short: %s\n", rule_str);
         exit(1);
@@ -112,11 +118,35 @@ void add_rule(const char *rule_str)
         exit(1);
     }
     rule = malloc(sizeof(struct rule_t));
-    rule->val1 = malloc(length);
-    memcpy(rule->val1, rule_str + 1, length);
-    rule->val2 = malloc(length);
-    memcpy(rule->val2, pos + 1, length);
-    rule->length = length;
+    if ((encoded) || (delim == 'x')) {
+        if (length % 2) {
+            fprintf(stderr, "hex encoding specified, but pattern has odd length: %s\n", rule_str);
+            exit(1);
+        }
+        rule->val1 = malloc(length/2);
+        for (i=1; i < length; i+=2) {
+            if (sscanf(&(rule_str[i]), "%2hhx", &(decoded[(i-1)/2])) != 1) {
+                fprintf(stderr, "hex decoding failed for string: %.*s\n", length, (rule_str + 1));
+                exit(1);
+            }
+        }
+        memcpy(rule->val1, decoded, length);
+        rule->val2 = malloc(length/2);
+        for (i=1; i < length; i+=2) {
+            if (sscanf(&(pos[i]), "%2hhx", &(decoded[(i-1)/2])) != 1) {
+                fprintf(stderr, "hex decoding failed for string: %.*s\n", length, (pos + 1));
+                exit(1);
+            }
+        }
+        memcpy(rule->val2, decoded, length);
+        rule->length = length / 2;
+    } else {
+        rule->val1 = malloc(length);
+        memcpy(rule->val1, rule_str + 1, length);
+        rule->val2 = malloc(length);
+        memcpy(rule->val2, pos + 1, length);
+        rule->length = length;
+    }
     rule->next = NULL;
     if (rules) {
         rule->next = rules;
@@ -181,7 +211,7 @@ uint8_t *find(const struct rule_t *rule, uint8_t *payload, int payload_length)
 {
     int rule_len = rule->length;
     int i = 0, j = 0, match = 0;
-    for (i = 0 ; i < payload_length - rule_len ; i++) {
+    for (i = 0 ; i <= payload_length - rule_len ; i++) {
         match = 1;
         for (j = 0 ; j < rule_len ; j++) {
             if (payload[i+j] != rule->val1[j]) {
@@ -211,7 +241,7 @@ static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
     if (ph) {
         id = ntohl(ph->packet_id);
     }
-    len = nfq_get_payload(nfa, &payload);
+    len = nfq_get_payload(nfa, (char**)&payload);
     if (len < 0) {
         fprintf(stderr, "Error getting payload\n");
         return len;
@@ -283,7 +313,7 @@ void read_queue()
 
     fd = nfq_fd(h);
     while ((rv = recv(fd, buf, sizeof(buf), 0)) && rv >= 0) {
-        if (verbose) {
+        if (verbose == 2) {
             printf("packet received\n");
         }
         nfq_handle_packet(h, buf, rv);
@@ -306,10 +336,17 @@ void read_queue()
 int main(int argc, char *argv[])
 {
     int opt;
-    while ((opt = getopt(argc, argv, "vs:f:q:")) != -1) {
+
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
+
+    while ((opt = getopt(argc, argv, "evs:f:q:")) != -1) {
         switch (opt) {
+            case 'e':
+                encoded = (encoded == 0);
+                break;
             case 'v':
-                verbose = 1;
+                verbose++;
                 break;
             case 's':
                 add_rule(optarg);
